@@ -1,0 +1,105 @@
+name: Decrypt kanzuliman.enc
+
+on:
+  workflow_dispatch:
+    inputs:
+      enc_url:
+        description: "kanzuliman.enc ফাইলের direct download link"
+        required: true
+        type: string
+      package_name:
+        description: "App package name (key বানাতে লাগে)"
+        required: false
+        default: "com.abswer.kanzuliman"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  decrypt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Download .enc file
+        env:
+          ENC_URL: ${{ inputs.enc_url }}
+        run: |
+          mkdir -p work
+          curl -fL --retry 3 --connect-timeout 30 -o work/kanzuliman.enc "$ENC_URL"
+          ls -l work/kanzuliman.enc
+          SIZE=$(stat -c%s work/kanzuliman.enc)
+          if [ "$SIZE" -le 16 ]; then
+            echo "::error::File too small ($SIZE bytes). Link ঠিক আছে কি না দেখো (HTML page নয়, direct link লাগবে)."
+            exit 1
+          fi
+          if head -c 200 work/kanzuliman.enc | grep -qiE "<!DOCTYPE html|<html"; then
+            echo "::error::Downloaded an HTML page, not the .enc file. Direct download link দাও।"
+            exit 1
+          fi
+
+      - name: Write decrypt script
+        run: |
+          cat > decrypt.py <<'PYEOF'
+          import sys, hashlib
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+          # App-এর DatabaseSecurity ক্লাস থেকে পাওয়া seed (byte array -> string)
+          DEV_SEED = bytes([77,111,104,97,109,109,97,100,32,78,111,114,117,108,32,65,98,115,119,101,114]).decode()
+          SALT_SEED = bytes([75,97,110,122,117,108,73,109,97,110,95,81,117,114,97,110,95,84,97,102,115,105,114,95,50,48,50,54,95,83,101,99,117,114,101,95,68,98,95,75,101,121,95,83,101,101,100]).decode()
+          TAG_SEED = bytes([35,65,98,115,119,101,114,45,75,97,110,122,117,108,73,109,97,110,45,66,101,115,112,111,107,101,45,50,48,50,54,35]).decode()
+
+          def derive_key(pkg):
+              b = f"{pkg}::{SALT_SEED}::{DEV_SEED}::{TAG_SEED}".encode("utf-8")
+              d = hashlib.sha256(b).digest()
+              return hashlib.sha256(bytes(x ^ 90 for x in d) + b).digest()
+
+          def main(src, dst, pkg):
+              data = open(src, "rb").read()
+              iv, ct = data[:16], data[16:]          # প্রথম 16 byte = IV
+              dec = Cipher(algorithms.AES(derive_key(pkg)), modes.CTR(iv)).decryptor()
+              out = dec.update(ct) + dec.finalize()  # AES-256-CTR, no padding
+              open(dst, "wb").write(out)
+              ok = out.startswith(b"SQLite format 3\x00")
+              print(f"Decrypted size: {len(out)} bytes")
+              print("SQLite header check:", "PASSED" if ok else "FAILED")
+              if not ok:
+                  sys.exit(2)
+
+          if __name__ == "__main__":
+              main(sys.argv[1], sys.argv[2], sys.argv[3])
+          PYEOF
+
+      - name: Decrypt
+        env:
+          PKG: ${{ inputs.package_name }}
+        run: python decrypt.py work/kanzuliman.enc work/kanzuliman.db "$PKG"
+
+      - name: Verify database with sqlite3
+        run: |
+          python - <<'PYEOF'
+          import sqlite3
+          con = sqlite3.connect("work/kanzuliman.db")
+          tables = [r[0] for r in con.execute("select name from sqlite_master where type='table' order by name")]
+          print("Tables found:", len(tables))
+          for t in tables:
+              n = con.execute(f'select count(*) from "{t}"').fetchone()[0]
+              print(f" - {t}: {n} rows")
+          PYEOF
+          sha256sum work/kanzuliman.db
+
+      - name: Upload decrypted database
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanzuliman-decrypted-db
+          path: work/kanzuliman.db
+          retention-days: 7
+          if-no-files-found: error
