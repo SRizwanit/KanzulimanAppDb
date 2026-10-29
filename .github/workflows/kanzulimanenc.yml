@@ -1,4 +1,4 @@
-name: Decrypt kanzuliman.enc
+name: Decrypt kanzuliman.enc and export tables to JSON
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ permissions:
 jobs:
   decrypt:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -83,11 +83,12 @@ jobs:
           PKG: ${{ inputs.package_name }}
         run: python decrypt.py work/kanzuliman.enc work/kanzuliman.db "$PKG"
 
-      - name: Verify database with sqlite3
+      - name: Verify database
         run: |
           python - <<'PYEOF'
           import sqlite3
           con = sqlite3.connect("work/kanzuliman.db")
+          print("Integrity check:", con.execute("pragma integrity_check").fetchone()[0])
           tables = [r[0] for r in con.execute("select name from sqlite_master where type='table' order by name")]
           print("Tables found:", len(tables))
           for t in tables:
@@ -96,10 +97,80 @@ jobs:
           PYEOF
           sha256sum work/kanzuliman.db
 
+      - name: Write DB to JSON converter script
+        run: |
+          cat > db_to_json.py <<'PYEOF'
+          import sqlite3, json, os, re, base64, sys
+
+          db, out = sys.argv[1], sys.argv[2]
+          os.makedirs(out, exist_ok=True)
+
+          con = sqlite3.connect(db)
+          con.row_factory = sqlite3.Row
+
+          def clean(v):
+              # BLOB কলাম JSON-এ রাখা যায় না, তাই base64 করা হয়
+              if isinstance(v, (bytes, bytearray, memoryview)):
+                  return {"__blob_base64__": base64.b64encode(bytes(v)).decode()}
+              return v
+
+          tables = [r[0] for r in con.execute(
+              "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name")]
+
+          summary = {}
+          used = set()
+          for t in tables:
+              rows = [{k: clean(r[k]) for k in r.keys()} for r in con.execute(f'select * from "{t}"')]
+              base = re.sub(r"[^\w.-]", "_", t)
+              fn, i = base + ".json", 1
+              while fn in used:
+                  i += 1
+                  fn = f"{base}_{i}.json"
+              used.add(fn)
+              # ensure_ascii=False: বাংলা/আরবি টেক্সট যেমন আছে তেমন থাকবে
+              with open(os.path.join(out, fn), "w", encoding="utf-8") as f:
+                  json.dump(rows, f, ensure_ascii=False, indent=2)
+              summary[t] = {"file": fn, "rows": len(rows)}
+              print(f"{t}: {len(rows)} rows -> {fn}")
+
+          with open(os.path.join(out, "_summary.json"), "w", encoding="utf-8") as f:
+              json.dump(summary, f, ensure_ascii=False, indent=2)
+          print("Total tables exported:", len(tables))
+          PYEOF
+
+      - name: Convert every table to its own JSON file
+        run: python db_to_json.py work/kanzuliman.db work/json
+
+      - name: List JSON output
+        run: |
+          ls -lh work/json
+          du -sh work/json
+
+      - name: Zip JSON files
+        run: |
+          cd work
+          zip -r kanzuliman-json.zip json
+
       - name: Upload decrypted database
         uses: actions/upload-artifact@v4
         with:
           name: kanzuliman-decrypted-db
           path: work/kanzuliman.db
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload JSON files (one per table)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanzuliman-json-tables
+          path: work/json/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload JSON zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanzuliman-json-zip
+          path: work/kanzuliman-json.zip
           retention-days: 7
           if-no-files-found: error
